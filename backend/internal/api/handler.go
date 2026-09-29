@@ -235,6 +235,22 @@ func (h *Handler) broadcastClusterError(cluster, errorMsg string) {
 	log.Printf("Broadcast cluster error for %s: %s - %s", cluster, errorCode, errorMessage)
 }
 
+// BroadcastJSON sends an arbitrary JSON message to every connected UI.
+func (h *Handler) BroadcastJSON(msg any) {
+	if h.wsHub == nil {
+		return
+	}
+	data, err := jsonv2.Marshal(msg)
+	if err != nil {
+		log.Printf("Failed to marshal broadcast message: %v", err)
+		return
+	}
+	h.wsHub.RangeConnections(func(conn *core.Connection) bool {
+		_ = conn.Send(data)
+		return true
+	})
+}
+
 func (h *Handler) BroadcastClustersRefreshed(clusters []k8s.ClusterInfo, reason string) {
 	if h.wsHub == nil {
 		log.Printf("Cannot broadcast clusters refreshed event: wsHub is nil")
@@ -375,8 +391,9 @@ func (h *Handler) parallelResourceCount(ctx context.Context, cluster string, res
 	for i := 0; i < len(resources); i++ {
 		result := <-resultChan
 		if result.err != nil {
-			zero := 0
-			resources[result.index].Count = &zero
+			// Unknown, not zero: the sidebar renders a nil count as "–" and the
+			// watcher publishes the real number once the list stream starts.
+			resources[result.index].Count = nil
 		} else {
 			c := result.count
 			resources[result.index].Count = &c

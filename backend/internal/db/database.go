@@ -61,16 +61,6 @@ type SSOSession struct {
 	UpdatedAt int64  `json:"updatedAt"`
 }
 
-type SSOActiveAccount struct {
-	ID          uint   `gorm:"primaryKey" json:"id"`
-	StartURL    string `gorm:"not null" json:"startUrl"`
-	AccountID   string `gorm:"not null" json:"accountId"`
-	AccountName string `json:"accountName"`
-	ProfileName string `json:"profileName"`
-	RoleName    string `json:"roleName"`
-	ExpiresAt   int64  `json:"expiresAt"`
-}
-
 func New() (*DB, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -109,7 +99,7 @@ func New() (*DB, error) {
 	db.Exec("PRAGMA locking_mode = NORMAL")   // Allow concurrent access
 	db.Exec("PRAGMA read_uncommitted = true") // Allow dirty reads for better concurrency
 
-	if err := db.AutoMigrate(&ClusterGroup{}, &ClusterAssignment{}, &ClusterAlias{}, &SSOSession{}, &SSOActiveAccount{}, &ClusterMetricsSettings{}); err != nil {
+	if err := db.AutoMigrate(&ClusterGroup{}, &ClusterAssignment{}, &ClusterAlias{}, &SSOSession{}, &ClusterMetricsSettings{}, &ClusterAWSBinding{}); err != nil {
 		return nil, err
 	}
 
@@ -129,6 +119,11 @@ func New() (*DB, error) {
 	// feature, never abort startup into a crash loop on the user's DB.
 	if err := dbInstance.MigrateSnapshots(); err != nil {
 		log.Printf("[DB] snapshot table migration failed, list snapshots disabled: %v", err)
+	}
+
+	// One-time schema steps for databases created by earlier releases.
+	if err := dbInstance.runVersionedMigrations(); err != nil {
+		return nil, err
 	}
 
 	// Create or update predefined groups
@@ -481,27 +476,4 @@ func (db *DB) UpdateSSOSessionExpiry(startURL string, expiresAt int64) error {
 
 func (db *DB) DeleteSSOSession(startURL string) error {
 	return db.DB.Where("start_url = ?", startURL).Delete(&SSOSession{}).Error
-}
-
-func (db *DB) GetSSOActiveAccount() (*SSOActiveAccount, error) {
-	var account SSOActiveAccount
-	err := db.DB.First(&account).Error
-	if err != nil {
-		return nil, err
-	}
-	return &account, nil
-}
-
-func (db *DB) SetSSOActiveAccount(account *SSOActiveAccount) error {
-	if err := db.DB.Where("1 = 1").Delete(&SSOActiveAccount{}).Error; err != nil {
-		return err
-	}
-	if account == nil {
-		return nil
-	}
-	return db.DB.Create(account).Error
-}
-
-func (db *DB) ClearSSOActiveAccount() error {
-	return db.DB.Where("1 = 1").Delete(&SSOActiveAccount{}).Error
 }

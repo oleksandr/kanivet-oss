@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import TreeNode from './TreeNode';
+import { findTreeResourceNode } from '../utils/searchResults';
 import ScrollContainer from './ScrollContainer';
 import DebugPanel from './DebugPanel';
 import { useRegisteredKeyboard } from '../hooks/useRegisteredKeyboard';
@@ -32,13 +33,20 @@ const TreeSidebar = ({ mode: _mode }: TreeSidebarProps = {}) => {
     openDetailTab,
   } = useStore(useShallow((s) => ({ currentTab: s.currentTab, loadTreeData: s.loadTreeData, setSearchQuery: s.setSearchQuery, expandNode: s.expandNode, selectNode: s.selectNode, loadListItems: s.loadListItems, loadDetails: s.loadDetails, recordNavigation: s.recordNavigation, setFocusArea: s.setFocusArea, toggleNodeExpansion: s.toggleNodeExpansion, openResourceListTab: s.openResourceListTab, openDetailTab: s.openDetailTab })));
 
-  const { treeData, searchQuery, focusArea } = useStore(useShallow((s) => {
+  const { treeData, searchQuery, focusArea, selectedNode } = useStore(useShallow((s) => {
     const t = s.getCurrentTabState();
-    return { treeData: t?.treeData || EMPTY_TREE, searchQuery: t?.searchQuery || '', focusArea: t?.focusArea || 'tree' };
+    return { treeData: t?.treeData || EMPTY_TREE, searchQuery: t?.searchQuery || '', focusArea: t?.focusArea || 'tree', selectedNode: t?.selectedNode || null };
   }));
 
   const [localSearch, setLocalSearch] = useState('');
   const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
+  // What moved the cursor last. The row ring is drawn only for keyboard moves;
+  // a mouse click selects (blue fill) and must not leave a ring behind.
+  const [navMode, setNavMode] = useState<'pointer' | 'keyboard'>('pointer');
+  const focusNodeByKeyboard = useCallback((value: React.SetStateAction<string | null>) => {
+    setNavMode('keyboard');
+    setFocusedNodeId(value);
+  }, []);
   const [width, setWidth] = useState(() => {
     const saved = localStorage.getItem('treeSidebarWidth');
     const defaultWidth = Math.floor(window.innerWidth * 0.2);
@@ -214,6 +222,30 @@ const TreeSidebar = ({ mode: _mode }: TreeSidebarProps = {}) => {
     return map;
   }, [clusterData]);
 
+  // The single tree row that shows as selected. Selections made from search,
+  // links or list tabs carry a node built outside the tree; match it to the
+  // tree's own node for that resource type by id first, then by coordinates.
+  const effectiveSelectedId = useMemo(() => {
+    if (!selectedNode) return null;
+    if (selectedNode.id && nodeIndexMap.has(selectedNode.id)) return selectedNode.id;
+    if (selectedNode.type === 'resource' && selectedNode.data?.name) {
+      const match = findTreeResourceNode(
+        clusterData,
+        selectedNode.data.group || '',
+        selectedNode.data.version,
+        selectedNode.data.name,
+      );
+      if (match) return match.id;
+    }
+    return selectedNode.id || null;
+  }, [selectedNode, nodeIndexMap, clusterData]);
+
+  // Keep the keyboard cursor on the selected row whenever the selection
+  // changes, so a row selected elsewhere is not shown next to a stale cursor.
+  useEffect(() => {
+    if (effectiveSelectedId) setFocusedNodeId(effectiveSelectedId);
+  }, [effectiveSelectedId]);
+
   const handleNodeClick = useCallback(
     async (node: any, isPinned: boolean = false) => {
       if (node.disabled) return;
@@ -384,7 +416,7 @@ const TreeSidebar = ({ mode: _mode }: TreeSidebarProps = {}) => {
     focusArea,
     () => allNodesMemo,
     focusedNodeId,
-    setFocusedNodeId,
+    focusNodeByKeyboard,
   );
 
   useRegisteredKeyboard({
@@ -436,6 +468,7 @@ const TreeSidebar = ({ mode: _mode }: TreeSidebarProps = {}) => {
           return;
         e.preventDefault();
         if (!focusedNodeId) return;
+        setNavMode('keyboard');
         const node = nodeIndexMap.get(focusedNodeId);
         if (node?.expanded && node.type !== 'resource') {
           toggleNodeExpansion(node.id);
@@ -455,6 +488,7 @@ const TreeSidebar = ({ mode: _mode }: TreeSidebarProps = {}) => {
           return;
         e.preventDefault();
         if (!focusedNodeId) return;
+        setNavMode('keyboard');
         const node = nodeIndexMap.get(focusedNodeId);
         if (node?.expanded && node.type !== 'resource') {
           toggleNodeExpansion(node.id);
@@ -474,6 +508,7 @@ const TreeSidebar = ({ mode: _mode }: TreeSidebarProps = {}) => {
           return;
         e.preventDefault();
         if (!focusedNodeId) return;
+        setNavMode('keyboard');
         const node = nodeIndexMap.get(focusedNodeId);
         if (!node || node.disabled) return;
         if (node.type === 'resource' || node.type === 'argo-overview') {
@@ -502,6 +537,7 @@ const TreeSidebar = ({ mode: _mode }: TreeSidebarProps = {}) => {
           return;
         e.preventDefault();
         if (!focusedNodeId) return;
+        setNavMode('keyboard');
         const node = nodeIndexMap.get(focusedNodeId);
         if (!node || node.disabled) return;
         if (node.type === 'resource' || node.type === 'argo-overview') {
@@ -530,6 +566,7 @@ const TreeSidebar = ({ mode: _mode }: TreeSidebarProps = {}) => {
           return;
         e.preventDefault();
         if (!focusedNodeId) return;
+        setNavMode('keyboard');
         const node = nodeIndexMap.get(focusedNodeId);
         if (node) {
           await handleNodeClick(node, true);
@@ -586,11 +623,13 @@ const TreeSidebar = ({ mode: _mode }: TreeSidebarProps = {}) => {
     <div
       ref={sidebarRef}
       className={`tree-sidebar ${focusArea === 'tree' ? 'focused' : ''}`}
+      data-nav={navMode}
       style={{
         width: `${width}px`,
         minWidth: `${width}px`,
         maxWidth: `${width}px`,
       }}
+      onMouseDown={() => setNavMode('pointer')}
       onClick={() => setFocusArea('tree')}
     >
       <div className="sidebar-header">
@@ -610,28 +649,19 @@ const TreeSidebar = ({ mode: _mode }: TreeSidebarProps = {}) => {
         viewportClassName="tree-viewport"
       >
         <div className="tree-content">
-          {(() => {
-            const ideNode = {
-              id: 'kanivetide-root',
-              label: 'kanivetIDE',
-              type: 'category',
-              expanded: true,
-              children: clusterData,
-            };
-            return (
-              <>
-                <TreeNode
-                  key={`${currentTab}-${ideNode.id}`}
-                  node={ideNode}
-                  level={0}
-                  searchQuery={searchQuery}
-                  focusedNodeId={focusedNodeId}
-                  onNodeClick={handleNodeClick}
-                  ancestorLabels={[]}
-                />
-              </>
-            );
-          })()}
+          {clusterData.map((node: any, index: number) => (
+            <TreeNode
+              key={`${currentTab}-${node.id}`}
+              node={node}
+              level={0}
+              searchQuery={searchQuery}
+              focusedNodeId={focusedNodeId}
+              selectedNodeId={effectiveSelectedId}
+              onNodeClick={handleNodeClick}
+              isLast={index === clusterData.length - 1}
+              ancestorLabels={[]}
+            />
+          ))}
         </div>
       </ScrollContainer>
       <DebugPanel

@@ -169,25 +169,32 @@ export interface DashboardOverviewData {
   lastUpdated?: number;
 }
 
-export interface SSOSession {
-  startUrl: string;
-  region: string;
-  expiresAt: number;
-  label?: string;
-}
-
-export interface SSOSlice {
-  ssoSessions: SSOSession[];
-  ssoSessionsLoading: boolean;
-  ssoSessionsLoaded: boolean;
-  activeSsoSession: string | null;
-  setSsoSessions: (sessions: SSOSession[]) => void;
-  addSsoSession: (session: SSOSession) => void;
-  removeSsoSession: (startUrl: string) => void;
-  updateSsoSessionLabel: (startUrl: string, label: string) => void;
-  setActiveSsoSession: (startUrl: string | null) => void;
-  loadSsoSessions: () => Promise<void>;
-  refreshSsoSession: (startUrl: string, region: string) => Promise<void>;
+export interface CloudAuthSlice {
+  /** Last /cloud/auth snapshot; null until the first load. */
+  authSummary: import('../types/cloud').CloudAuthSummary | null;
+  authLoading: boolean;
+  authLoaded: boolean;
+  /** Convenience mirror of authSummary.aws.sessions. */
+  ssoSessions: import('../types/cloud').SSOSessionStatus[];
+  /** Interactive AWS SSO logins keyed by normalized start URL (pending or last result). */
+  ssoLogins: Record<string, import('../types/cloud').SSOLoginSession>;
+  /** gcloud / az sign-ins in progress or just finished. */
+  providerLogins: Partial<Record<'gcp' | 'azure', import('../types/cloud').CloudLoginJob>>;
+  /** `aws sso login --profile …` jobs keyed by profile name. */
+  profileLogins: Record<string, import('../types/cloud').CloudLoginJob>;
+  loadAuthSummary: (force?: boolean) => Promise<void>;
+  /** Starts (or joins) an interactive AWS SSO login and resolves once it ends. */
+  signInSSO: (startUrl: string, region?: string) => Promise<boolean>;
+  cancelSSOLogin: (startUrl: string) => Promise<void>;
+  /** Silent refresh-token renewal; false when an interactive sign-in is needed. */
+  refreshSSO: (startUrl: string) => Promise<boolean>;
+  signOutSSO: (startUrl: string) => Promise<void>;
+  addSsoSession: (startUrl: string, region: string, label?: string) => Promise<boolean>;
+  removeSsoSession: (startUrl: string) => Promise<void>;
+  updateSsoSessionLabel: (startUrl: string, label: string) => Promise<void>;
+  signInProvider: (provider: 'gcp' | 'azure') => Promise<boolean>;
+  signInAWSProfile: (profile: string) => Promise<boolean>;
+  cancelProviderLogin: (provider: 'gcp' | 'azure') => Promise<void>;
 }
 
 export interface StoreState extends
@@ -201,7 +208,7 @@ export interface StoreState extends
   ResourceListTabSlice,
   HelmSlice,
   ToastSlice,
-  SSOSlice,
+  CloudAuthSlice,
   ConnectionSlice {
   monitoringSettings: MonitoringSettings;
   setMonitoringSettings: (settings: Partial<MonitoringSettings>) => void;
@@ -213,6 +220,7 @@ export interface ClusterSlice {
   clusters: string[];
   clusterStatuses: Record<string, import('../types').ClusterStatus>;
   clusterAliases: Record<string, string>;
+  clusterProviders: Record<string, 'aws' | 'gcp' | 'azure'>;
   clusterErrors: Record<string, ClusterError>;
   vclusterStatuses: Record<string, VClusterStatus>;
   clusterDashboards: Record<string, DashboardOverviewData>;
@@ -279,6 +287,12 @@ export interface ResourceSlice {
 export interface RealtimeSlice {
   startRealtime: (forceRefresh?: boolean) => void;
   _startRealtimeInternal: (forceRefresh?: boolean) => void;
+  // Takes the on-screen subscription off screen but keeps it open, so a later
+  // switch back to it is instant.
+  parkRealtime: () => void;
+  // Closes the subscriptions, on screen or parked, whose topic matches.
+  releaseRealtimeTopics: (shouldRelease: (topic: string) => boolean) => void;
+  // Closes every subscription.
   stopRealtime: () => void;
 }
 

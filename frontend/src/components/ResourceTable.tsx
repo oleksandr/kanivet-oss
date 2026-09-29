@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, memo, useMemo, useCallback, useId } from 'react';
-import { useVirtualizer } from '@tanstack/react-virtual';
+import { useVirtualizer, observeElementRect, type Virtualizer } from '@tanstack/react-virtual';
 import ResourceRow from './ResourceRow';
 import { useResizableColumns } from '../hooks/useResizableColumns';
 import { hasActions as hasResourceActions } from '../utils/resourceActions';
@@ -41,6 +41,14 @@ const DEFAULT_OVERSCAN = 10;
 const LARGE_LIST_OVERSCAN = 6;
 const VIRTUALIZATION_THRESHOLD = 150;
 const VERY_LARGE_LIST_THRESHOLD = 2000;
+const estimateRowSize = () => ROW_HEIGHT;
+
+// A tab kept mounted while hidden measures 0x0. Ignoring that keeps its rows
+// rendered, so the table is complete on the first frame it is shown again.
+const observeVisibleRect = (instance: Virtualizer<HTMLElement, Element>, cb: (rect: { width: number; height: number }) => void) =>
+  observeElementRect(instance, (rect) => {
+    if (rect.width > 0 || rect.height > 0) cb(rect);
+  });
 
 const ResourceTable = memo(
   ({
@@ -175,7 +183,10 @@ const ResourceTable = memo(
     useEffect(() => {
       const wrapper = scrollContainerRef.current?.closest('.resource-table-scroll-wrapper') as HTMLElement | null;
       if (!wrapper) return;
-      const update = () => setWrapperWidth(wrapper.clientWidth);
+      const update = () => {
+        // A tab kept mounted while hidden measures zero; keep the last real width.
+        if (wrapper.clientWidth > 0) setWrapperWidth(wrapper.clientWidth);
+      };
       update();
       const ro = new ResizeObserver(update);
       ro.observe(wrapper);
@@ -195,12 +206,15 @@ const ResourceTable = memo(
 
     const overscan = displayItems.length > VERY_LARGE_LIST_THRESHOLD ? LARGE_LIST_OVERSCAN : DEFAULT_OVERSCAN;
 
+    const getItemKey = useCallback((index: number) => itemKeys[index] ?? index, [itemKeys]);
+
     const virtualizer = useVirtualizer({
       count: displayItems.length,
       getScrollElement,
-      estimateSize: () => ROW_HEIGHT,
+      estimateSize: estimateRowSize,
       overscan,
-      getItemKey: (index) => itemKeys[index] ?? index,
+      getItemKey,
+      observeElementRect: observeVisibleRect,
     });
 
     const virtualItems = virtualizer.getVirtualItems();
@@ -441,7 +455,13 @@ const ResourceTable = memo(
                         if (loadError) {
                           return (
                             <div className="error-state">
-                              <span className="error-icon">⚠️</span>
+                              <span className="error-icon" aria-hidden="true">
+                                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M10.3 3.9 1.8 18.1a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+                                  <line x1="12" y1="9" x2="12" y2="13" />
+                                  <line x1="12" y1="17" x2="12.01" y2="17" />
+                                </svg>
+                              </span>
                               <span className="error-message">{loadError}</span>
                               <button className="retry-button" onClick={onRetry}>Retry</button>
                             </div>

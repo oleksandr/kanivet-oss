@@ -321,68 +321,6 @@ func TestNewAWSProviderMigratesImportedEKSExecAuthToNeverInteractive(t *testing.
 	}
 }
 
-func TestCacheSSOTokenWritesDeterministicSessionAndLegacyKanivetCompatibilityOnly(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-
-	configPath := filepath.Join(home, ".aws", "config")
-	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
-		t.Fatalf("mkdir aws dir: %v", err)
-	}
-
-	config := `[profile kanivet-sso-123456789012-Admin]
-sso_start_url = https://example.awsapps.com/start/
-sso_region = eu-west-1
-sso_account_id = 123456789012
-sso_role_name = Admin
-region = eu-west-1
-
-[sso-session shared]
-sso_start_url = https://example.awsapps.com/start/
-sso_region = eu-west-1
-`
-	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	p := &AWSProvider{}
-	token := ssoTokenCache{
-		StartURL:              "https://example.awsapps.com/start",
-		Region:                "eu-west-1",
-		AccessToken:           "access-token",
-		ExpiresAt:             "2026-08-04T12:00:00Z",
-		RefreshToken:          "refresh-token",
-		ClientID:              "client-id",
-		ClientSecret:          "client-secret",
-		RegistrationExpiresAt: "2026-09-04T12:00:00Z",
-	}
-	if err := p.cacheSSOToken(token); err != nil {
-		t.Fatalf("cacheSSOToken: %v", err)
-	}
-
-	deterministic := readCachedSSOToken(t, kanivetSSOSessionName(token.StartURL))
-	assertCachedSSOTokenMode(t, kanivetSSOSessionName(token.StartURL))
-	if deterministic.RefreshToken != token.RefreshToken {
-		t.Fatal("deterministic session cache did not persist the refresh token")
-	}
-	if deterministic.ClientID != token.ClientID {
-		t.Fatal("deterministic session cache did not persist the client ID")
-	}
-	if deterministic.ClientSecret != token.ClientSecret {
-		t.Fatal("deterministic session cache did not persist the client secret")
-	}
-
-	legacy := readCachedSSOToken(t, "https://example.awsapps.com/start/")
-	assertCachedSSOTokenMode(t, "https://example.awsapps.com/start/")
-	if legacy.AccessToken != token.AccessToken {
-		t.Fatal("legacy kanivet cache did not persist the access token")
-	}
-
-	assertMissingCachedSSOToken(t, "shared")
-	assertMissingCachedSSOToken(t, token.StartURL)
-}
-
 func readCachedSSOToken(t *testing.T, key string) ssoTokenCache {
 	t.Helper()
 
@@ -429,5 +367,79 @@ func assertCachedSSOTokenMode(t *testing.T, key string) {
 	}
 	if mode := info.Mode().Perm(); runtime.GOOS != "windows" && mode != 0o600 {
 		t.Fatalf("cache mode for %q=%#o, want 0600", key, mode)
+	}
+}
+
+// A legacy profile sets both sso_region (where the Identity Center portal
+// lives) and region (where the profile's API calls go). Only sso_region can
+// serve the OIDC device flow, so parsing must not let region shadow it.
+func TestParseAWSSSOConfigPrefersSSORegionOverProfileRegion(t *testing.T) {
+	cfg := ini.Empty()
+
+	sec, err := cfg.NewSection("profile mgmt-plus")
+	if err != nil {
+		t.Fatalf("failed to create section: %v", err)
+	}
+	for key, value := range map[string]string{
+		"sso_start_url":  "https://d-9c677582bd.awsapps.com/start",
+		"sso_region":     "eu-west-2",
+		"sso_account_id": "111122223333",
+		"sso_role_name":  "AdministratorAccess",
+		"region":         "eu-west-1",
+	} {
+		if _, err := sec.NewKey(key, value); err != nil {
+			t.Fatalf("failed to set %s: %v", key, err)
+		}
+	}
+
+	_, profiles := parseAWSSSOConfig(cfg)
+	if len(profiles) != 1 {
+		t.Fatalf("expected 1 profile, got %d", len(profiles))
+	}
+
+	prof := profiles[0]
+	if !prof.Legacy {
+		t.Errorf("expected profile to be marked legacy")
+	}
+	if prof.Region != "eu-west-2" {
+		t.Errorf("expected sso_region eu-west-2, got %q", prof.Region)
+	}
+}
+
+// A legacy profile is the only place a region can come from when the config
+// predates sso-session blocks, so the portal lookup has to read profiles too.
+func TestSSORegionForStartURLFallsBackToLegacyProfile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", dir)
+	}
+
+	awsDir := filepath.Join(dir, ".aws")
+	if err := os.MkdirAll(awsDir, 0o755); err != nil {
+		t.Fatalf("failed to create .aws: %v", err)
+	}
+	contents := "" +
+		"[profile mgmt-plus]\n" +
+		"sso_start_url = https://d-9c677582bd.awsapps.com/start\n" +
+		"sso_region = eu-west-2\n" +
+		"sso_account_id = 111122223333\n" +
+		"sso_role_name = AdministratorAccess\n" +
+		"region = eu-west-1\n"
+	if err := os.WriteFile(filepath.Join(awsDir, "config"), []byte(contents), 0o600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	if got := ssoRegionForStartURL("https://d-9c677582bd.awsapps.com/start"); got != "eu-west-2" {
+		t.Errorf("expected eu-west-2, got %q", got)
+	}
+
+	// A trailing slash and differing case must resolve to the same portal.
+	if got := ssoRegionForStartURL("https://D-9C677582BD.awsapps.com/start/"); got != "eu-west-2" {
+		t.Errorf("expected eu-west-2 for normalized URL, got %q", got)
+	}
+
+	if got := ssoRegionForStartURL("https://other.awsapps.com/start"); got != "" {
+		t.Errorf("expected empty region for unknown portal, got %q", got)
 	}
 }

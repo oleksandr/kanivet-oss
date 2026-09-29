@@ -19,9 +19,10 @@ import {
   ChevronRightIcon,
   LayersIcon,
   GearIcon,
+  ExclamationTriangleIcon,
 } from '@radix-ui/react-icons';
 import KeyboardShortcutsEditor from './KeyboardShortcutsEditor';
-import SSOSessionManager from './SSOSessionManager';
+import CloudAccountsMenu from './CloudAccountsMenu';
 import ConnectionStatusIndicator from './ConnectionStatusIndicator';
 import './TabBar.css';
 
@@ -36,9 +37,10 @@ const TabBar = ({ onOpenSettings }: TabBarProps) => {
     closeTab,
     openBottomTab,
     clusterAliases,
+    clusterProviders,
     reorderTabs,
     clusterErrors,
-  } = useStore(useShallow((s) => ({ currentTab: s.currentTab, setCurrentTab: s.setCurrentTab, closeTab: s.closeTab, openBottomTab: s.openBottomTab, clusterAliases: s.clusterAliases, reorderTabs: s.reorderTabs, clusterErrors: s.clusterErrors })));
+  } = useStore(useShallow((s) => ({ currentTab: s.currentTab, setCurrentTab: s.setCurrentTab, closeTab: s.closeTab, openBottomTab: s.openBottomTab, clusterAliases: s.clusterAliases, clusterProviders: s.clusterProviders, reorderTabs: s.reorderTabs, clusterErrors: s.clusterErrors })));
   const tabIds = useStore(useShallow((s) => s.activeTabs.map((t) => t.id)));
   const tabNames = useStore(useShallow((s) => s.activeTabs.map((t) => t.name)));
   const activeTabs = useMemo(() => tabIds.map((id, i) => ({ id, name: tabNames[i] })), [tabIds, tabNames]);
@@ -251,7 +253,7 @@ const TabBar = ({ onOpenSettings }: TabBarProps) => {
       <div className="tab-bar-divider" />
       <div className="tabs-container" ref={tabsContainerRef}>
         {activeTabs.map((tab, index) => {
-          const clusterInfo = parseClusterName(tab.id, clusterAliases[tab.id]);
+          const clusterInfo = parseClusterName(tab.id, clusterAliases[tab.id], clusterProviders[tab.id]);
           const isActive = currentTab === tab.id;
           const isDragging = draggedIndex === index;
           const showLeftIndicator = dropIndicator?.index === index && dropIndicator.side === 'left';
@@ -366,7 +368,7 @@ const TabBar = ({ onOpenSettings }: TabBarProps) => {
           >
             <KeyboardIcon width={16} height={16} />
           </button>
-          <SSOSessionManager />
+          <CloudAccountsMenu />
           <button
             className="theme-toggle"
             onClick={toggleTheme}
@@ -395,6 +397,14 @@ const TabBar = ({ onOpenSettings }: TabBarProps) => {
             aria-label="Search"
           >
             <MagnifyingGlassIcon width={16} height={16} />
+          </button>
+          <button
+            className="theme-toggle"
+            onClick={() => window.open('https://github.com/kanivet-ai/kanivet-oss/issues/new?template=bug_report.md', '_blank', 'noopener,noreferrer')}
+            title="Report a bug"
+            aria-label="Report a bug"
+          >
+            <ExclamationTriangleIcon width={16} height={16} />
           </button>
           {onOpenSettings && (
             <button

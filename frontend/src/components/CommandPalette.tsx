@@ -1,16 +1,20 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import './CommandPalette.css';
 import api from '../services/api';
 import { useStore } from '../store';
 import { useShallow } from 'zustand/react/shallow';
-import type { SearchResult } from '../types/search';
+import type { RecentResource, SearchResult } from '../types/search';
 import logger from '../utils/logger';
 import { getResourceIcon } from '../utils/resourceIcons';
 import {
-  kindToResource,
-  getResourceCategory,
-  kindToResourceDef,
-} from '../utils/resourceUtils';
+  dedupeByIdentity,
+  dedupeSearchResults,
+  describeKindDefinition,
+  describeSearchResource,
+  findTreeResourceNode,
+  resourceIdentity,
+  resourceListNode,
+} from '../utils/searchResults';
 
 interface CommandPaletteProps {
   isOpen: boolean;
@@ -25,12 +29,37 @@ const getShortClusterName = (cluster: string): string => {
   return cluster;
 };
 
+/**
+ * One row the arrow keys can land on, in the order the rows are painted.
+ * Results are grouped by category on screen, so the flat `results` array is
+ * not a valid keyboard order — walking it made the highlight jump between
+ * sections.
+ */
+type NavItem =
+  | { kind: 'recent'; recent: RecentResource }
+  | { kind: 'result'; result: SearchResult };
+
+const CATEGORY_ORDER = [
+  'Workloads',
+  'Networking',
+  'Configuration',
+  'Storage',
+  'Security',
+  'Autoscaling',
+  'Policy',
+  'Cluster',
+  'Other',
+];
+
+/** Pointer travel (px) before mouse hover is allowed to move the selection again. */
+const POINTER_WAKE_DISTANCE = 4;
+
 const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
-  const [recentSearches, setRecentSearches] = useState<{ name: string; kind: string; namespace?: string; cluster: string; apiVersion?: string; category?: string }[]>([]);
+  const [recentSearches, setRecentSearches] = useState<RecentResource[]>([]);
   const [showRecent, setShowRecent] = useState(true);
   // Filters
   const [clusters, setClusters] = useState<string[]>([]);
@@ -51,6 +80,11 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
   const inputRef = useRef<HTMLInputElement>(null);
   const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
+  // While the keyboard drives the selection, a row sliding under a resting
+  // cursor must not steal it. Hover takes over again once the pointer moves.
+  const [pointerNav, setPointerNav] = useState(true);
+  const pointerNavRef = useRef(true);
+  const pointerRestRef = useRef<{ x: number; y: number } | null>(null);
 
   const {
     currentTab,
@@ -136,7 +170,9 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
   const loadRecentSearches = async () => {
     try {
       const recent = await api.getRecentSearches(5);
-      setRecentSearches(recent);
+      // Entries saved by earlier releases may name the same object under two
+      // spellings of its kind; show each object once.
+      setRecentSearches(dedupeByIdentity(recent, resourceIdentity));
     } catch (error) {
       logger.error('Failed to load recent searches', error);
     }
@@ -160,10 +196,12 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
           effectiveClusters && effectiveClusters.length > 0
             ? effectiveClusters
             : undefined;
-        const searchResults = await api.search(searchQuery, {
-          clusters: useClusters,
-          limit: 50,
-        });
+        const searchResults = dedupeSearchResults(
+          await api.search(searchQuery, {
+            clusters: useClusters,
+            limit: 50,
+          }),
+        );
 
         // Prioritize current tab cluster when showing All clusters
         let ordered = searchResults;
@@ -260,41 +298,162 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
     }
   };
 
+  // Separate kind definition results from regular resource results
+  const kindDefinitionResults = useMemo(
+    () => results.filter((r) => r.resource.kind === 'KindDefinition'),
+    [results],
+  );
+  const resourceResults = useMemo(
+    () => results.filter((r) => r.resource.kind !== 'KindDefinition'),
+    [results],
+  );
+
+  // Apply category filter, then group by category in the painted order
+  const groupedResults = useMemo(() => {
+    const display =
+      categoryFilter === 'All'
+        ? resourceResults
+        : resourceResults.filter((r) => r.resource.category === categoryFilter);
+    return display.reduce<Record<string, SearchResult[]>>((acc, result) => {
+      const groupKey = result.resource.category || 'Other';
+      (acc[groupKey] ||= []).push(result);
+      return acc;
+    }, {});
+  }, [resourceResults, categoryFilter]);
+
+  const sortedCategories = useMemo(
+    () =>
+      Object.keys(groupedResults).sort((a, b) => {
+        const aIndex = CATEGORY_ORDER.indexOf(a);
+        const bIndex = CATEGORY_ORDER.indexOf(b);
+        return (aIndex === -1 ? 999 : aIndex) - (bIndex === -1 ? 999 : bIndex);
+      }),
+    [groupedResults],
+  );
+
+  const availableCategories = useMemo(
+    () =>
+      Array.from(new Set(resourceResults.map((r) => r.resource.category || 'Other'))).sort(
+        (a, b) => CATEGORY_ORDER.indexOf(a) - CATEGORY_ORDER.indexOf(b),
+      ),
+    [resourceResults],
+  );
+
+  // The rows in the exact order they are rendered: Recent while idle,
+  // otherwise kinds first and then each category section.
+  const navItems = useMemo<NavItem[]>(() => {
+    if (showRecent) return recentSearches.map((recent) => ({ kind: 'recent', recent }));
+    const ordered: NavItem[] = kindDefinitionResults.map((result) => ({ kind: 'result', result }));
+    for (const category of sortedCategories) {
+      for (const result of groupedResults[category]) ordered.push({ kind: 'result', result });
+    }
+    return ordered;
+  }, [showRecent, recentSearches, kindDefinitionResults, sortedCategories, groupedResults]);
+
+  const navIndexByResult = useMemo(() => {
+    const map = new Map<SearchResult, number>();
+    navItems.forEach((item, index) => {
+      if (item.kind === 'result') map.set(item.result, index);
+    });
+    return map;
+  }, [navItems]);
+
+  // Keep the highlight on a real row when the list shrinks or is re-filtered.
+  useEffect(() => {
+    setSelectedIndex((prev) => Math.min(prev, Math.max(navItems.length - 1, 0)));
+  }, [navItems.length]);
+
+  useEffect(() => {
+    setSelectedIndex(0);
+  }, [categoryFilter]);
+
+  // Scroll after the highlight has actually moved (the previous version
+  // queried `.selected` before React re-rendered, so it followed the old row).
+  useEffect(() => {
+    const row = resultsRef.current?.querySelector<HTMLElement>(`[data-nav-index="${selectedIndex}"]`);
+    row?.scrollIntoView({ block: 'nearest' });
+  }, [selectedIndex, navItems]);
+
+  const setKeyboardNav = () => {
+    pointerNavRef.current = false;
+    pointerRestRef.current = null;
+    setPointerNav(false);
+  };
+
+  const handleRowMouseEnter = (index: number) => {
+    if (pointerNavRef.current) setSelectedIndex(index);
+  };
+
+  const handleResultsMouseMove = (e: React.MouseEvent) => {
+    if (pointerNavRef.current) return;
+    const rest = pointerRestRef.current;
+    if (!rest) {
+      pointerRestRef.current = { x: e.clientX, y: e.clientY };
+      return;
+    }
+    if (Math.abs(e.clientX - rest.x) < POINTER_WAKE_DISTANCE && Math.abs(e.clientY - rest.y) < POINTER_WAKE_DISTANCE) return;
+    pointerNavRef.current = true;
+    pointerRestRef.current = null;
+    setPointerNav(true);
+    // The cursor is already resting inside a row, so no mouseenter will fire
+    // for it — pick it up here.
+    const row = (e.target as HTMLElement).closest<HTMLElement>('[data-nav-index]');
+    const index = row ? Number(row.dataset.navIndex) : NaN;
+    if (Number.isInteger(index)) setSelectedIndex(index);
+  };
+
+  const activateNavItem = (item: NavItem) => {
+    if (item.kind === 'recent') {
+      handleRecentResourceSelect(item.recent);
+      return;
+    }
+    const sel = item.result as any;
+    if (sel?.resource?.kind === 'Cluster' && sel?.resource?.name) {
+      const { openTab, setCurrentTab } = useStore.getState();
+      openTab(sel.resource.name);
+      setCurrentTab(sel.resource.name);
+      onClose();
+      return;
+    }
+    if (sel?.resource?.kind === 'Command') {
+      const id = String(sel.resource.id || '').replace(/^cmd:/, '');
+      if (id === 'switch-cluster') {
+        primeClusterSwitch();
+        return;
+      }
+    }
+    handleResultSelect(item.result);
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     switch (e.key) {
       case 'ArrowDown':
         e.preventDefault();
-        setSelectedIndex((prev) => Math.min(prev + 1, results.length - 1));
-        scrollToSelected();
+        setKeyboardNav();
+        setSelectedIndex((prev) => Math.min(prev + 1, Math.max(navItems.length - 1, 0)));
         break;
 
       case 'ArrowUp':
         e.preventDefault();
+        setKeyboardNav();
         setSelectedIndex((prev) => Math.max(prev - 1, 0));
-        scrollToSelected();
         break;
 
-      case 'Enter':
+      case 'Home':
+      case 'End': {
+        if (navItems.length === 0) break;
         e.preventDefault();
-        if (results.length > 0 && selectedIndex >= 0) {
-          const sel = results[selectedIndex] as any;
-          if (sel?.resource?.kind === 'Cluster' && sel?.resource?.name) {
-            const { openTab, setCurrentTab } = useStore.getState();
-            openTab(sel.resource.name);
-            setCurrentTab(sel.resource.name);
-            onClose();
-            return;
-          }
-          if (sel?.resource?.kind === 'Command') {
-            const id = String(sel.resource.id || '').replace(/^cmd:/, '');
-            if (id === 'switch-cluster') {
-              primeClusterSwitch();
-              return;
-            }
-          }
-          handleResultSelect(results[selectedIndex]);
-        }
+        setKeyboardNav();
+        setSelectedIndex(e.key === 'Home' ? 0 : navItems.length - 1);
         break;
+      }
+
+      case 'Enter': {
+        e.preventDefault();
+        const item = navItems[selectedIndex];
+        if (item) activateNavItem(item);
+        break;
+      }
 
       case 'Escape':
         e.preventDefault();
@@ -330,24 +489,11 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
     setCategoryFilter(category);
   };
 
-  // Scroll to selected item
-  const scrollToSelected = () => {
-    if (resultsRef.current) {
-      const selectedElement = resultsRef.current.querySelector('.selected');
-      if (selectedElement) {
-        selectedElement.scrollIntoView({
-          block: 'nearest',
-          behavior: 'smooth',
-        });
-      }
-    }
-  };
-
   // Handle kind definition selection
   const handleKindSelect = async (result: SearchResult) => {
     const { resource } = result;
-    const targetKind = resource.name; // The actual kind name
     const targetCluster = resource.cluster;
+    const target = describeKindDefinition(resource);
 
     onClose();
 
@@ -385,93 +531,26 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
 
-    // Navigate to the kind in the tree
-    // For custom resources, we need to get the actual plural resource name from labels
-    let resourceName = '';
-
-    // Get resource definition info - check if it's a known k8s resource
-    const resourceDef = kindToResourceDef(targetKind);
-    let group = '';
-    let version = 'v1';
-    let namespaced = true;
-
-    if (resourceDef) {
-      // Known Kubernetes resource - use our plural conversion
-      resourceName = kindToResource(targetKind);
-      group = resourceDef.group;
-      version = resourceDef.version;
-      namespaced = resourceDef.namespaced;
-    } else {
-      // Custom resource - extract info from search result
-      // Use group and version from the search result if available
-      if (resource.group) {
-        group = resource.group;
-      } else if (resource.labels && resource.labels['group']) {
-        group = resource.labels['group'];
-      }
-
-      if (resource.version) {
-        version = resource.version;
-      } else if (resource.labels && resource.labels['version']) {
-        version = resource.labels['version'];
-      }
-
-      // Check namespaced flag
-      if (resource.labels && resource.labels['namespaced'] === 'false') {
-        namespaced = false;
-      }
-
-      // The resource.labels should contain the actual plural resource name
-      if (resource.labels && resource.labels['resource-name']) {
-        resourceName = resource.labels['resource-name'];
-      } else {
-        // Fallback to simple pluralization
-        resourceName = kindToResource(targetKind);
-      }
-    }
-
-    const categoryId = getResourceCategory(group, resourceName);
-
+    const { categoryId } = target;
     await expandNode(targetCluster, categoryId, 'category', { categoryId });
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    // For custom resources, we might need to expand the apiVersion level
-    if (categoryId === 'crossplane' || categoryId === 'custom') {
-      // We don't have group/version info for kind definitions, so we can't expand further
-      // User will need to manually expand to find the specific API version
-    }
+    // Prefer the node the tree built from discovery: it carries the exact
+    // kind, scope and version. Fall back to one shaped from the result.
+    const treeData = getCurrentTabState()?.treeData || [];
+    const node =
+      findTreeResourceNode(treeData, target.group, target.version, target.resourceName, { anyVersion: true }) ||
+      resourceListNode(target);
 
-    // Create a tree node for this kind
-    const treeNodeId = `${categoryId}-${
-      group || 'core'
-    }-${version}-${resourceName}`;
-    const node = {
-      id: treeNodeId,
-      label: resourceName,
-      type: 'resource' as const,
-      data: {
-        name: resourceName, // The plural resource name (e.g., "pods", "tenants")
-        group: group,
-        version: version,
-        kind: targetKind, // Backend expects singular Kind and will pluralize it
-        namespaced: namespaced,
-      },
-    };
-
-    selectNode(node as any);
+    // Open the list exactly the way a sidebar click does.
+    selectNode(node);
     setFocusArea('list');
-
-    await loadListItems(targetCluster, (node as any).data);
-    await openResourceListTab(
-      (node as any).data,
-      targetCluster,
-      true,
-      undefined,
-    );
-    await recordNavigation('resource', treeNodeId, (node as any).data);
+    await openResourceListTab(node.data, targetCluster, true, undefined);
+    await loadListItems(targetCluster, node.data);
+    await recordNavigation('resource', node.id, node.data);
 
     logger.info('Selected kind definition', {
-      kind: targetKind,
+      kind: target.kind,
       cluster: targetCluster,
     });
   };
@@ -480,28 +559,35 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
   const handleResultSelect = async (result: SearchResult) => {
     const { resource } = result;
 
-    // Save clicked resource to history
-    api.saveSearchHistory({
-      name: resource.name,
-      kind: resource.kind,
-      namespace: resource.namespace,
-      cluster: resource.cluster,
-      apiVersion: resource.apiVersion,
-      category: resource.category,
-    });
-
     // Handle kind definitions differently
     if (resource.kind === 'KindDefinition') {
       return handleKindSelect(result);
     }
 
+    // Resolve the plural resource name and the Kind up front. Documents
+    // indexed by earlier releases carry the plural in `kind`, which used to
+    // produce a "Deployments" tab whose realtime subscription never matched.
+    const target = describeSearchResource(resource);
+
+    // Save clicked resource to history with both spellings normalised, so the
+    // same object never shows up twice in Recent.
+    api.saveSearchHistory({
+      name: target.name,
+      kind: target.kind,
+      namespace: target.namespace,
+      cluster: target.cluster,
+      apiVersion: target.apiVersion,
+      category: resource.category,
+      resource: target.resourceName,
+    });
+
     onClose();
 
     const { setCurrentTab, openTab, updateCurrentTabState } =
       useStore.getState();
-    if (resource.cluster !== currentTab) {
-      openTab(resource.cluster);
-      setCurrentTab(resource.cluster);
+    if (target.cluster !== currentTab) {
+      openTab(target.cluster);
+      setCurrentTab(target.cluster);
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
 
@@ -516,12 +602,12 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
       loadDetails,
     } = useStore.getState();
 
-    await loadTreeData(resource.cluster);
+    await loadTreeData(target.cluster);
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     const cur = getCurrentTabState();
     if (
-      resource.namespace &&
+      target.namespace &&
       cur?.selectedNamespace !== 'all' &&
       cur?.selectedNamespace !== undefined
     ) {
@@ -532,65 +618,42 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
 
-    const rawKind = String(resource.kind || '');
-    const capKind = rawKind
-      ? rawKind.charAt(0).toUpperCase() + rawKind.slice(1)
-      : '';
-    const resourceName = rawKind.toLowerCase().endsWith('s')
-      ? rawKind.toLowerCase()
-      : kindToResource(capKind);
-    const group =
-      resource.group ||
-      (resource.apiVersion && resource.apiVersion.includes('/')
-        ? resource.apiVersion.split('/')[0]
-        : '');
-    const version =
-      resource.version ||
-      (resource.apiVersion && resource.apiVersion.includes('/')
-        ? resource.apiVersion.split('/')[1]
-        : resource.apiVersion || 'v1');
-    const categoryId = getResourceCategory(group, resourceName);
+    const { categoryId, group, version, resourceName } = target;
 
-    await expandNode(resource.cluster, categoryId, 'category', { categoryId });
+    await expandNode(target.cluster, categoryId, 'category', { categoryId });
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     if (categoryId === 'crossplane' || categoryId === 'custom') {
       const apiVersionNodeId = `${categoryId}-${group || 'core'}-${version}`;
-      toggleNodeExpansion(apiVersionNodeId);
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      if (!getCurrentTabState()?.expandedNodes.has(apiVersionNodeId)) {
+        toggleNodeExpansion(apiVersionNodeId);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
     }
 
-    const treeNodeId = `${categoryId}-${
-      group || 'core'
-    }-${version}-${resourceName}`;
-    const nodeData = {
-      name: resourceName,
-      group,
-      version,
-      kind: capKind,
-      namespaced: !!resource.namespace,
-    };
-    const node = {
-      id: treeNodeId,
-      label: resourceName,
-      type: 'resource' as const,
-      data: nodeData,
-    };
+    // Prefer the node the tree built from discovery, so the tab, its title
+    // and its realtime subscription use the cluster's own spelling of the
+    // type; otherwise shape one exactly like the sidebar would.
+    const treeData = getCurrentTabState()?.treeData || [];
+    const node =
+      findTreeResourceNode(treeData, group, version, resourceName, { anyVersion: true }) ||
+      resourceListNode(target);
+    const nodeData = node.data;
 
-    selectNode(node as any);
+    // Open the list the same way a sidebar click does.
+    selectNode(node);
     setFocusArea('list');
-
-    await loadListItems(resource.cluster, nodeData);
-    await openResourceListTab(nodeData, resource.cluster, false, undefined);
-    await recordNavigation('resource', treeNodeId, nodeData);
+    await openResourceListTab(nodeData, target.cluster, false, undefined);
+    await loadListItems(target.cluster, nodeData);
+    await recordNavigation('resource', node.id, nodeData);
 
     const findTarget = () => {
       const state = getCurrentTabState();
       const items = state?.listItems || [];
       return items.find(
         (i: any) =>
-          i?.name === resource.name &&
-          (!resource.namespace || i?.namespace === resource.namespace),
+          i?.name === target.name &&
+          (!target.namespace || i?.namespace === target.namespace),
       );
     };
 
@@ -608,8 +671,8 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
       if (activeListTabId)
         updateResourceListTab(activeListTabId, { selectedItem: targetItem });
       const enhancedItem = {
-        kind: capKind,
-        apiVersion: group ? `${group}/${version}` : version,
+        kind: nodeData.kind,
+        apiVersion: nodeData.group ? `${nodeData.group}/${nodeData.version}` : nodeData.version,
         metadata: {
           name: targetItem.name,
           namespace: targetItem.namespace,
@@ -630,25 +693,25 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
         ...targetItem,
       };
       const { openDetailTab } = useStore.getState();
-      openDetailTab(nodeData, enhancedItem, resource.cluster);
-      await loadDetails(resource.cluster, nodeData, targetItem);
+      openDetailTab(nodeData, enhancedItem, target.cluster);
+      await loadDetails(target.cluster, nodeData, targetItem);
       updateCurrentTabState({ isDetailsPanelCollapsed: false });
     } else {
       logger.warn('Target item not found after waiting', {
-        name: resource.name,
-        namespace: resource.namespace,
+        name: target.name,
+        namespace: target.namespace,
         resource: resourceName,
       });
     }
 
     logger.info('Selected search result', {
-      resource: resource.name,
-      kind: resource.kind,
+      resource: target.name,
+      kind: target.kind,
     });
   };
 
   // Handle recent resource selection
-  const handleRecentResourceSelect = (resource: { name: string; kind: string; namespace?: string; cluster: string; apiVersion?: string; category?: string }) => {
+  const handleRecentResourceSelect = (resource: RecentResource) => {
     const [group, version] = (resource.apiVersion || 'v1').includes('/')
       ? (resource.apiVersion || '').split('/')
       : ['', resource.apiVersion || 'v1'];
@@ -657,6 +720,7 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
         id: `${resource.cluster}/${resource.kind}/${resource.namespace || ''}/${resource.name}`,
         name: resource.name,
         kind: resource.kind,
+        resource: resource.resource,
         namespace: resource.namespace || '',
         cluster: resource.cluster,
         apiVersion: resource.apiVersion || 'v1',
@@ -671,58 +735,6 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
     };
     handleResultSelect(searchResult);
   };
-
-  // No pluralization helper needed; backend returns already-plural resource kinds
-
-  // Separate kind definition results from regular resource results
-  const kindDefinitionResults = results.filter(
-    (r) => r.resource.kind === 'KindDefinition',
-  );
-  const resourceResults = results.filter(
-    (r) => r.resource.kind !== 'KindDefinition',
-  );
-
-  // Apply category filter
-  let displayResults = resourceResults;
-  if (categoryFilter !== 'All') {
-    displayResults = displayResults.filter(
-      (r) => r.resource.category === categoryFilter,
-    );
-  }
-
-  // Group regular results by category
-  const groupedResults = displayResults.reduce<Record<string, SearchResult[]>>(
-    (acc, result) => {
-      const groupKey = result.resource.category || 'Other';
-      if (!acc[groupKey]) {
-        acc[groupKey] = [];
-      }
-      acc[groupKey].push(result);
-      return acc;
-    },
-    {},
-  );
-
-  const categoryOrder = [
-    'Workloads',
-    'Networking',
-    'Configuration',
-    'Storage',
-    'Security',
-    'Autoscaling',
-    'Policy',
-    'Cluster',
-    'Other',
-  ];
-  const sortedCategories = Object.keys(groupedResults).sort((a, b) => {
-    const aIndex = categoryOrder.indexOf(a);
-    const bIndex = categoryOrder.indexOf(b);
-    return (aIndex === -1 ? 999 : aIndex) - (bIndex === -1 ? 999 : bIndex);
-  });
-
-  const availableCategories = Array.from(
-    new Set(resourceResults.map((r) => r.resource.category || 'Other')),
-  ).sort((a, b) => categoryOrder.indexOf(a) - categoryOrder.indexOf(b));
 
   if (!isOpen) return null;
 
@@ -840,7 +852,11 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
           </div>
         )}
 
-        <div className="command-palette-results" ref={resultsRef}>
+        <div
+          className={`command-palette-results${pointerNav ? '' : ' keyboard-nav'}`}
+          ref={resultsRef}
+          onMouseMove={handleResultsMouseMove}
+        >
           {showRecent && recentSearches.length > 0 && (
             <div className="command-palette-section">
               <div className="command-palette-section-header">
@@ -849,7 +865,9 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
               {recentSearches.map((resource, index) => (
                 <div
                   key={index}
-                  className="command-palette-recent-item"
+                  className={`command-palette-recent-item ${index === selectedIndex ? 'selected' : ''}`}
+                  data-nav-index={index}
+                  onMouseEnter={() => handleRowMouseEnter(index)}
                   onClick={() => handleRecentResourceSelect(resource)}
                 >
                   <span className="command-palette-icon">{getResourceIcon(resource.kind)}</span>
@@ -887,8 +905,8 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
                     Resource Kinds
                   </div>
                   {kindDefinitionResults.map((result: SearchResult) => {
-                    const globalIndex = results.indexOf(result);
-                    const isSelected = globalIndex === selectedIndex;
+                    const navIndex = navIndexByResult.get(result) ?? -1;
+                    const isSelected = navIndex === selectedIndex;
                     const resource = result.resource;
                     const actualKind = resource.name; // The actual kind name is stored in name field
 
@@ -898,7 +916,8 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
                         className={`command-palette-result ${
                           isSelected ? 'selected' : ''
                         }`}
-                        onMouseEnter={() => setSelectedIndex(globalIndex)}
+                        data-nav-index={navIndex}
+                        onMouseEnter={() => handleRowMouseEnter(navIndex)}
                         onClick={() => handleResultSelect(result)}
                       >
                         <span className="command-palette-icon">
@@ -930,11 +949,13 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
                     {category}
                   </div>
                   {groupedResults[category].map((result: SearchResult) => {
-                    const globalIndex = results.indexOf(result);
-                    const isSelected = globalIndex === selectedIndex;
+                    const navIndex = navIndexByResult.get(result) ?? -1;
+                    const isSelected = navIndex === selectedIndex;
 
                     const resource = result.resource;
-                    const kind = resource.kind.toLowerCase();
+                    // Quick actions are keyed by plural resource name, which
+                    // covers documents that carry either spelling of the kind.
+                    const kind = describeSearchResource(resource).resourceName;
 
                     const hasActions =
                       kind === 'pods' ||
@@ -1084,7 +1105,8 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose }) => {
                         className={`command-palette-result ${
                           isSelected ? 'selected' : ''
                         }`}
-                        onMouseEnter={() => setSelectedIndex(globalIndex)}
+                        data-nav-index={navIndex}
+                        onMouseEnter={() => handleRowMouseEnter(navIndex)}
                       >
                         <span className="command-palette-icon">
                           {getResourceIcon(resource.kind)}

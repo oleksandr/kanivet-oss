@@ -1,5 +1,5 @@
 import { ClusterStatus } from '../types';
-import { SearchResult, SearchOptions } from '../types/search';
+import { SearchResult, SearchOptions, RecentResource } from '../types/search';
 import { HelmRelease, HelmReleaseDetail, HelmHistoryResponse } from '../types/helm';
 import { wsManager } from './api/websocket';
 import { apiClient } from './api/client';
@@ -193,7 +193,7 @@ class API {
   async search(query: string, options: SearchOptions = {}): Promise<SearchResult[]> { return searchApi.search(query, options); }
   async getSearchSuggestions(prefix: string, limit: number = 10): Promise<string[]> { return searchApi.getSearchSuggestions(prefix, limit); }
   async getRecentSearches(limit: number = 10) { return searchApi.getRecentSearches(limit); }
-  async saveSearchHistory(resource: { name: string; kind: string; namespace?: string; cluster: string; apiVersion?: string; category?: string }): Promise<void> {
+  async saveSearchHistory(resource: RecentResource): Promise<void> {
     return searchApi.saveSearchHistory(resource);
   }
   async indexCluster(cluster: string): Promise<void> { return searchApi.indexCluster(cluster); }
@@ -222,7 +222,7 @@ class API {
   }
 
   async getAvailableMetricProviders(): Promise<string[]> { return metrics.getAvailableMetricProviders(); }
-  async detectMetricsProvider(cluster: string): Promise<any> { return metrics.detectMetricsProvider(cluster); }
+  async detectMetricsProvider(cluster: string, options?: metrics.DetectMetricsProviderOptions): Promise<metrics.MetricsProvidersStatus> { return metrics.detectMetricsProvider(cluster, options); }
   async installMetricsProvider(cluster: string, provider: string, namespace?: string): Promise<void> {
     return metrics.installMetricsProvider(cluster, provider, namespace);
   }
@@ -234,7 +234,7 @@ class API {
     return metrics.discoverMimirTenants(cluster, hints);
   }
   async listMimirServices(cluster: string) { return metrics.listMimirServices(cluster); }
-  markMetricsProviderUnavailable(cluster: string, reason?: string): any {
+  markMetricsProviderUnavailable(cluster: string, reason?: string): metrics.MetricsProvidersStatus {
     return metrics.markMetricsProviderUnavailable(cluster, reason);
   }
   clearMetricsProviderAvailabilityCache(cluster?: string): void {
@@ -246,7 +246,7 @@ class API {
   isMetricsProviderUnavailableCached(cluster: string): boolean {
     return metrics.isMetricsProviderUnavailableCached(cluster);
   }
-  getCachedMetricsProviderStatus(cluster: string): any | null {
+  getCachedMetricsProviderStatus(cluster: string): metrics.MetricsProvidersStatus | null {
     return metrics.getCachedMetricsProviderStatus(cluster);
   }
   emitMetricsSettingsChanged(cluster: string): void { metrics.emitMetricsSettingsChanged(cluster); }

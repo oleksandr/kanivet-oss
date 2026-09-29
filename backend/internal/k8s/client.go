@@ -123,16 +123,57 @@ type Client struct {
 	mu                  sync.RWMutex
 	portForwardManager  *PortForwardManager
 	resourceNameCache   map[string]string
-	resourceNameMu      sync.RWMutex
+	// preferredVersions records, per cluster, the version each API group
+	// serves as preferred (from discovery), so indexers can skip the other
+	// served versions of the same resources. Guarded by resourceNameMu.
+	preferredVersions map[string]map[string]string
+	resourceNameMu    sync.RWMutex
 
 	contextIndexMu    sync.RWMutex
 	contextIndex      map[string]string
+	contextProviders  map[string]string
 	contextIndexStamp map[string]int64
+
+	// awsProfileResolver names the AWS profile Kanivet should use for a
+	// context instead of whatever its exec block resolves to. Guarded by mu.
+	awsProfileResolver func(cluster string) string
+	// onCacheReset runs after cached clients are dropped, so whatever chose
+	// their credentials can look again. Guarded by mu.
+	onCacheReset func()
+}
+
+// SetAWSProfileResolver installs the lookup for per-context AWS profiles. The
+// profile is applied to the exec plugin in memory; kubeconfig files are never
+// rewritten. Call RefreshClusterCache after a context's answer changes.
+func (c *Client) SetAWSProfileResolver(resolve func(cluster string) string) {
+	c.mu.Lock()
+	c.awsProfileResolver = resolve
+	c.mu.Unlock()
+}
+
+// SetOnCacheReset registers a callback for RefreshClusterCache. Dropped
+// clients are rebuilt on the next request, and that is when a different
+// credential source may be the one that works.
+func (c *Client) SetOnCacheReset(fn func()) {
+	c.mu.Lock()
+	c.onCacheReset = fn
+	c.mu.Unlock()
+}
+
+func (c *Client) awsProfileFor(cluster string) string {
+	c.mu.RLock()
+	resolve := c.awsProfileResolver
+	c.mu.RUnlock()
+	if resolve == nil {
+		return ""
+	}
+	return resolve(cluster)
 }
 
 func (c *Client) invalidateContextIndex() {
 	c.contextIndexMu.Lock()
 	c.contextIndex = nil
+	c.contextProviders = nil
 	c.contextIndexStamp = nil
 	c.contextIndexMu.Unlock()
 }
@@ -230,6 +271,7 @@ func NewClient() *Client {
 		vclusterStatusSubs:  make(map[uint64]chan VClusterStatus),
 		kubeconfigs:         discoverKubeconfigs(),
 		resourceNameCache:   make(map[string]string),
+		preferredVersions:   make(map[string]map[string]string),
 	}
 	c.portForwardManager = NewPortForwardManager(c)
 
@@ -261,10 +303,15 @@ func (c *Client) RefreshClusterCache(cluster string) {
 		delete(c.bulkMetadata, cluster)
 		delete(c.discovery, cluster)
 	}
+	onReset := c.onCacheReset
 	c.mu.Unlock()
+	if onReset != nil {
+		onReset()
+	}
 	c.resourceNameMu.Lock()
 	if cluster == "" {
 		clear(c.resourceNameCache)
+		clear(c.preferredVersions)
 	} else {
 		prefix := cluster + ":"
 		for k := range c.resourceNameCache {
@@ -272,6 +319,7 @@ func (c *Client) RefreshClusterCache(cluster string) {
 				delete(c.resourceNameCache, k)
 			}
 		}
+		delete(c.preferredVersions, cluster)
 	}
 	c.resourceNameMu.Unlock()
 }
@@ -305,14 +353,20 @@ func getOrCreate[T any](cache map[string]T, key string, creator func() (T, error
 type ClusterInfo struct {
 	Name       string `json:"name"`
 	Kubeconfig string `json:"kubeconfig"`
+	// Provider is "aws", "gcp" or "azure" when the context's server or
+	// credential plugin shows where the cluster runs, whatever it is named.
+	Provider string `json:"provider,omitempty"`
 }
 
 func (c *Client) ListClusters() ([]ClusterInfo, error) {
 	start := time.Now()
 	index := c.contextToKubeconfigIndex()
+	c.contextIndexMu.RLock()
+	providers := c.contextProviders
+	c.contextIndexMu.RUnlock()
 	clusters := make([]ClusterInfo, 0, len(index))
 	for name, path := range index {
-		clusters = append(clusters, ClusterInfo{Name: name, Kubeconfig: path})
+		clusters = append(clusters, ClusterInfo{Name: name, Kubeconfig: path, Provider: providers[name]})
 	}
 	sort.Slice(clusters, func(i, j int) bool { return clusters[i].Name < clusters[j].Name })
 	log.Printf("[K8S] ListClusters found %d clusters in %v", len(clusters), time.Since(start))
@@ -321,6 +375,12 @@ func (c *Client) ListClusters() ([]ClusterInfo, error) {
 
 func (c *Client) findKubeconfigForContext(contextName string) string {
 	return c.contextToKubeconfigIndex()[contextName]
+}
+
+// KubeconfigPathForContext returns the kubeconfig file defining contextName,
+// or "" when no discovered kubeconfig has it.
+func (c *Client) KubeconfigPathForContext(contextName string) string {
+	return c.findKubeconfigForContext(contextName)
 }
 
 // contextToKubeconfigIndex returns a map of every kubeconfig context name to the
@@ -351,6 +411,7 @@ func (c *Client) contextToKubeconfigIndex() map[string]string {
 	c.contextIndexMu.RUnlock()
 
 	index := make(map[string]string)
+	providers := make(map[string]string)
 	for _, path := range paths {
 		cfg, err := clientcmd.LoadFromFile(path)
 		if err != nil {
@@ -360,12 +421,16 @@ func (c *Client) contextToKubeconfigIndex() map[string]string {
 		for ctx := range cfg.Contexts {
 			if _, exists := index[ctx]; !exists {
 				index[ctx] = path
+				if provider := contextProvider(cfg, ctx); provider != "" {
+					providers[ctx] = provider
+				}
 			}
 		}
 	}
 
 	c.contextIndexMu.Lock()
 	c.contextIndex = index
+	c.contextProviders = providers
 	c.contextIndexStamp = stamp
 	c.contextIndexMu.Unlock()
 
@@ -408,6 +473,11 @@ func (c *Client) getConfigForCluster(cluster string) (*rest.Config, error) {
 		if context, ok := rawConfig.Contexts[cluster]; ok {
 			if authInfo, ok := rawConfig.AuthInfos[context.AuthInfo]; ok && authInfo.Exec != nil {
 				log.Printf("Cluster %s uses exec plugin: %s", cluster, authInfo.Exec.Command)
+
+				if profile := c.awsProfileFor(cluster); profile != "" {
+					log.Printf("Cluster %s authenticates with AWS profile %s chosen in Kanivet", cluster, profile)
+					applyAWSProfile(authInfo.Exec, profile)
+				}
 
 				// Ensure PATH environment variable is available for exec plugins
 				if authInfo.Exec.Env == nil {
@@ -667,12 +737,23 @@ func (c *Client) ListAPIResources(cluster string) ([]metav1.APIResource, error) 
 	// ServerGroupsAndResources uses aggregated discovery on K8s >= 1.26: every
 	// group and version in a single round trip, with automatic per-group
 	// fallback on older servers. All versions are returned, not just preferred.
-	_, resourceLists, err := discoveryClient.ServerGroupsAndResources()
+	apiGroups, resourceLists, err := discoveryClient.ServerGroupsAndResources()
 	if err != nil {
 		if len(resourceLists) == 0 {
 			return nil, fmt.Errorf("failed to get server resources: %w", err)
 		}
 		log.Printf("ListAPIResources partial discovery failure for cluster %s: %v", cluster, err)
+	}
+	if len(apiGroups) > 0 {
+		preferred := make(map[string]string, len(apiGroups))
+		for _, g := range apiGroups {
+			if g != nil && g.PreferredVersion.Version != "" {
+				preferred[g.Name] = g.PreferredVersion.Version
+			}
+		}
+		c.resourceNameMu.Lock()
+		c.preferredVersions[cluster] = preferred
+		c.resourceNameMu.Unlock()
 	}
 
 	var resources []metav1.APIResource
@@ -705,6 +786,20 @@ func (c *Client) ListAPIResources(cluster string) ([]metav1.APIResource, error) 
 	c.resourceNameMu.Unlock()
 
 	return resources, nil
+}
+
+// PreferredVersion returns the version discovery reported as preferred for an
+// API group on a cluster. It is known once ListAPIResources has run for that
+// cluster; ok is false before then.
+func (c *Client) PreferredVersion(cluster, group string) (string, bool) {
+	c.resourceNameMu.RLock()
+	defer c.resourceNameMu.RUnlock()
+	versions, ok := c.preferredVersions[cluster]
+	if !ok {
+		return "", false
+	}
+	v, ok := versions[group]
+	return v, ok
 }
 
 func (c *Client) ResolveKindToResource(cluster, group, version, kind string) (string, error) {
@@ -927,8 +1022,8 @@ func (c *Client) GetClusterStatus(cluster string) (*ClusterStatus, error) {
 	vr := <-versionCh
 	if vr.err != nil {
 		errStr := vr.err.Error()
-		if strings.Contains(strings.ToLower(errStr), "sso session") {
-			status.Error = "AWS SSO session expired or invalid"
+		if code, message, ok := ClassifyClusterError(errStr); ok && IsAuthErrorCode(code) {
+			status.Error = message
 		} else {
 			status.Error = fmt.Sprintf("Failed to get server version: %v", vr.err)
 		}
@@ -1504,7 +1599,10 @@ func (c *Client) GetResourceCount(ctx context.Context, cluster string, gvr schem
 	}
 	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	list, err := metadataClient.Resource(gvr).List(timeoutCtx, metav1.ListOptions{Limit: 1, ResourceVersion: "0"})
+	// No ResourceVersion "0" here: a list served from the watch cache ignores
+	// Limit and returns every object, so the count of 780 pods downloaded 780
+	// pods. A limited list returns one object plus remainingItemCount.
+	list, err := metadataClient.Resource(gvr).List(timeoutCtx, metav1.ListOptions{Limit: 1})
 	if err != nil {
 		return 0, fmt.Errorf("failed to count resources: %w", err)
 	}

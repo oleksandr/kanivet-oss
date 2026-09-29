@@ -375,6 +375,26 @@ func main() {
 		// Update API handler with the bridge for managing watches
 		apiHandler.SetWatcherBridge(bridge)
 
+		// Daily retention: drop cached rows for clusters gone from every
+		// kubeconfig, purge stale rows, and hand freed pages back to disk.
+		if database := apiHandler.GetDB(); database != nil {
+			database.StartMaintenance(appCtx, func() ([]string, error) {
+				clusters, err := k8sClient.ListClusters()
+				if err != nil {
+					return nil, err
+				}
+				names := make([]string, 0, len(clusters))
+				for _, c := range clusters {
+					names = append(names, c.Name)
+				}
+				return names, nil
+			}, func(purged []string) {
+				for _, c := range purged {
+					searchService.RemoveCluster(c)
+				}
+			})
+		}
+
 		// Trigger cheap schema indexing (API resource kinds only) when a new
 		// cluster is watched. Resource data is populated incrementally by the
 		// watcher's own List/Watch feeding through SearchBroadcaster, and the
@@ -617,11 +637,28 @@ func main() {
 			refreshClustersAndBroadcast("cloud_import")
 		}
 		cloudService.SetOnBatchComplete(invalidateClusterCache)
+		cloudService.SetKubeconfigResolver(k8sClient.KubeconfigPathForContext)
+		k8sClient.SetAWSProfileResolver(cloudService.AWSProfileForCluster)
+		k8sClient.SetOnCacheReset(cloudService.ForgetCredentialChecks)
+		cloudService.SetOnAuthChanged(func(provider cloud.Provider) {
+			// Auth changed (sign-in, silent refresh, terminal login, sign-out):
+			// drop cached clients so the next request re-runs the exec plugin,
+			// then tell every UI to re-read /cloud/auth and retry failed clusters.
+			k8sClient.RefreshClusterCache("")
+			helmService.ClearConfigCache()
+			apiHandler.BroadcastJSON(map[string]any{
+				"type":      "cloud_auth_changed",
+				"provider":  string(provider),
+				"timestamp": time.Now().UnixMilli(),
+			})
+		})
+		go cloudService.StartAuthMonitor(appCtx)
 		cloudHandler := cloud.NewHandler(cloudService)
 		cloudHandler.SetOnClusterImported(invalidateClusterCache)
 		cloudHandler.RegisterRoutes(v1)
 
 		configWatcher := cloud.NewConfigWatcher(cloud.DefaultConfigWatchPaths(), func(reason string) {
+			cloudService.NotifyExternalConfigChange(reason)
 			refreshClustersAndBroadcast("external_config_change:" + reason)
 		})
 		go configWatcher.Start(appCtx)
@@ -705,6 +742,9 @@ func main() {
 
 	// Shutdown handler components (event listeners, DB, etc.)
 	apiHandler.Shutdown()
+
+	// Stop in-flight log streams before the websocket server goes away.
+	logsHandler.Shutdown()
 
 	// Shutdown websocket server
 	if err := wsServer.Shutdown(ctx); err != nil {

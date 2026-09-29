@@ -9,15 +9,20 @@ interface TreeNodeProps {
   node: any;
   level: number;
   searchQuery: string;
+  /** Keyboard cursor: the row j/k and the arrow keys move. */
   focusedNodeId?: string | null;
+  /**
+   * The one tree node whose list is open. Resolved once by the sidebar so a
+   * selection made elsewhere (search, a link, a tab) highlights a single row.
+   */
+  selectedNodeId?: string | null;
   onNodeClick: (node: any, isPinned?: boolean) => void;
   isLast?: boolean;
   parentPath?: boolean[];
   ancestorLabels?: string[];
-  siblingsHaveChevron?: boolean;
 }
 
-const nodeHasChevron = (n: any): boolean =>
+export const nodeHasChevron = (n: any): boolean =>
   !n.disabled &&
   n.type !== 'resource' &&
   n.type !== 'overview' &&
@@ -51,16 +56,13 @@ const TreeNode = ({
   level,
   searchQuery,
   focusedNodeId,
+  selectedNodeId = null,
   onNodeClick,
   isLast = false,
   parentPath = [],
   ancestorLabels = [],
-  siblingsHaveChevron = true,
 }: TreeNodeProps) => {
   const currentTab = useStore((state) => state.currentTab);
-  const selectedNode = useStore(
-    (state) => state.getCurrentTabState()?.selectedNode,
-  );
   const nodeRef = useRef<HTMLDivElement>(null);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
@@ -73,16 +75,7 @@ const TreeNode = ({
   const fullPath = [...ancestorLabels, node.label].join(' ').toLowerCase();
   const isMatch = searchQuery && fullPath.includes(searchQuery.toLowerCase());
   const isFocused = focusedNodeId === node.id;
-  const isSelected = useMemo(() => {
-    if (!selectedNode) return false;
-    if (selectedNode.id && selectedNode.id === node.id) return true;
-    if (node.type === 'resource' && selectedNode.type === 'resource' && node.data && selectedNode.data) {
-      return node.data.name === selectedNode.data.name &&
-        node.data.group === selectedNode.data.group &&
-        node.data.version === selectedNode.data.version;
-    }
-    return false;
-  }, [selectedNode, node]);
+  const isSelected = !!selectedNodeId && selectedNodeId === node.id;
 
   const shouldShowNode = useMemo(() => {
     return nodeMatchesSearch(node, searchQuery, ancestorLabels);
@@ -94,11 +87,6 @@ const TreeNode = ({
       nodeMatchesSearch(child, searchQuery, [...ancestorLabels, node.label])
     );
   }, [node.children, expanded, searchQuery, ancestorLabels, node.label]);
-
-  const childrenHaveChevron = useMemo(
-    () => filteredChildren.some((c: any) => nodeHasChevron(c)),
-    [filteredChildren],
-  );
 
   const childMaxCountDigits = useMemo(() => {
     let m = 0;
@@ -134,17 +122,15 @@ const TreeNode = ({
     if (disabled) return;
 
     if (node.type === 'resource' || node.type === 'overview' || node.type === 'argo-overview' || node.type === 'helm') {
-      // Single vs double click: double click pins the tab
+      // The first click opens the resource at once; a second click within the
+      // double-click window pins the tab it opened.
       if (clickTimer) {
         clearTimeout(clickTimer);
         setClickTimer(null);
         onNodeClick(node, true);
       } else {
-        const timer = setTimeout(() => {
-          setClickTimer(null);
-          onNodeClick(node, false);
-        }, 200);
-        setClickTimer(timer);
+        onNodeClick(node, false);
+        setClickTimer(setTimeout(() => setClickTimer(null), 200));
       }
     } else {
       // For non-resource nodes, just expand/collapse
@@ -230,6 +216,7 @@ const TreeNode = ({
         onContextMenu={handleContextMenu}
         tabIndex={-1}
         aria-disabled={disabled}
+        title={disabled ? node.disabledReason || `${node.label} is not installed in this cluster` : undefined}
         draggable={node.type === 'resource' && !disabled}
         onDragStart={(e) => {
           if (node.type === 'resource') {
@@ -243,16 +230,17 @@ const TreeNode = ({
               align-items: center;
               gap: 8px;
               padding: 6px 12px;
-              background: var(--bg-secondary, #1e1e1e);
-              border: 1px solid var(--border-color, #333);
-              border-radius: 4px;
-              color: var(--text-primary, #fff);
+              background: var(--card);
+              border: 0;
+              border-radius: 7px;
+              color: var(--text);
+              font-family: var(--font-sans);
               font-size: 13px;
               position: absolute;
               top: -1000px;
               left: -1000px;
               pointer-events: none;
-              box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+              box-shadow: 0 0 0 0.5px var(--sep), var(--shadow-pop);
             `;
             
             const iconElement = e.currentTarget.querySelector('.tree-node-icon');
@@ -297,25 +285,25 @@ const TreeNode = ({
           })}
         </div>
         <div className="tree-node-content">
+          {/* The chevron column is always reserved, as in an outline view: a
+              group of leaves would otherwise sit left of its own parent. */}
           {nodeHasChevron(node) ? (
             <span className="tree-node-arrow">
               <ExpandIcon expanded={expanded} />
             </span>
-          ) : siblingsHaveChevron ? (
+          ) : (
             <span className="tree-node-arrow tree-node-arrow-placeholder" aria-hidden="true" />
-          ) : null}
+          )}
           {(node.type === 'resource' || node.type === 'apiVersion') && !node.hideCount && (
             <span className="tree-node-count">
               {node.count === undefined || node.count === null ? '-' : `${node.count}`}
             </span>
           )}
           <span className="tree-node-icon">
-            {node.id === 'kakauide-root'
-              ? getCategoryIcon('kanivetide')
-              : node.type === 'overview'
-                ? getCategoryIcon('overview')
-                : node.type === 'argo-overview'
-                  ? getCategoryIcon('argocd')
+            {node.type === 'overview'
+              ? getCategoryIcon('overview')
+              : node.type === 'argo-overview'
+                ? getCategoryIcon('argocd')
                 : node.type === 'finops'
                   ? getCategoryIcon('finops')
                   : node.type === 'helm'
@@ -352,11 +340,11 @@ const TreeNode = ({
               level={level + 1}
               searchQuery={searchQuery}
               focusedNodeId={focusedNodeId}
+              selectedNodeId={selectedNodeId}
               onNodeClick={onNodeClick}
               isLast={index === filteredChildren.length - 1}
               parentPath={[...parentPath, isLast]}
               ancestorLabels={[...ancestorLabels, node.label]}
-              siblingsHaveChevron={childrenHaveChevron}
             />
           ))}
         </div>
