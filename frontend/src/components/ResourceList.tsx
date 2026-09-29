@@ -13,6 +13,7 @@ import ResourceTable from './ResourceTable';
 import ClusterDashboard from './ClusterDashboard';
 import ArgoApplicationsPage from './ArgoApplicationsPage';
 import HelmPage from './HelmPage';
+import NatsPage from './NatsPage';
 import FinOpsDashboard from './finops/FinOpsDashboard';
 import IncidentTimelinePage from './incidents/IncidentTimelinePage';
 import ResourceControlsBar from './common/ResourceControlsBar';
@@ -33,7 +34,7 @@ import { getNextSortOrder, getSortIndicator } from '../utils/columnSorting';
 import './ResourceList.css';
 
 // Resource-list tabs that show a full page rather than a resource table.
-const PAGE_KINDS = new Set(['ClusterDashboard', 'FinOpsDashboard', 'HelmReleases', 'IncidentTimeline', 'ArgoApplicationsOverview']);
+const PAGE_KINDS = new Set(['ClusterDashboard', 'FinOpsDashboard', 'HelmReleases', 'IncidentTimeline', 'ArgoApplicationsOverview', 'NatsMonitoring']);
 
 interface ResourceListProps {
   paneId?: string;
@@ -975,6 +976,8 @@ const ResourceList = ({ paneId, isFocusedPane, onRequestPaneClose }: ResourceLis
                       <FinOpsDashboard key={`finops-dashboard-${tab.id}`} />
                     ) : tab.resource?.kind === 'HelmReleases' ? (
                       <HelmPage key={`helm-page-${tab.id}`} cluster={currentTab || ''} />
+                    ) : tab.resource?.kind === 'NatsMonitoring' ? (
+                      <NatsPage key={`nats-page-${tab.id}`} cluster={currentTab || ''} />
                     ) : tab.resource?.kind === 'IncidentTimeline' ? (
                       <IncidentTimelinePage key={`incident-timeline-${tab.id}`} cluster={currentTab || ''} />
                     ) : tab.resource?.kind === 'ArgoApplicationsOverview' ? (

@@ -30,7 +30,8 @@ export const nodeHasChevron = (n: any): boolean =>
   n.type !== 'helm' &&
   n.type !== 'vcluster' &&
   n.type !== 'finops' &&
-  n.type !== 'incident-timeline';
+  n.type !== 'incident-timeline' &&
+  n.type !== 'nats';
 
 const nodeMatchesSearch = (
   node: any,
@@ -308,15 +309,17 @@ const TreeNode = ({
                   ? getCategoryIcon('finops')
                   : node.type === 'helm'
                     ? getCategoryIcon('helm')
-                    : node.type === 'resource'
-                      ? getResourceIcon(node.label)
-                      : node.type === 'category'
-                        ? getCategoryIcon(node.label)
-                        : node.type === 'apiVersion'
-                          ? getCategoryIcon('package')
-                          : node.type === 'vclusters' || node.type === 'vcluster'
-                            ? getCategoryIcon('vclusters')
-                            : getCategoryIcon('folder')}
+                    : node.type === 'nats'
+                      ? getCategoryIcon('nats')
+                      : node.type === 'resource'
+                        ? getResourceIcon(node.label)
+                        : node.type === 'category'
+                          ? getCategoryIcon(node.label)
+                          : node.type === 'apiVersion'
+                            ? getCategoryIcon('package')
+                            : node.type === 'vclusters' || node.type === 'vcluster'
+                              ? getCategoryIcon('vclusters')
+                              : getCategoryIcon('folder')}
           </span>
           <div className="tree-node-label-wrapper">
             <span className="tree-node-label">{node.label}</span>
